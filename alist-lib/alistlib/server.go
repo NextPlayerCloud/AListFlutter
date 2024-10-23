@@ -4,30 +4,31 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/alist-org/alist/v3/alistlib/internal"
-	"github.com/alist-org/alist/v3/cmd"
-	"github.com/alist-org/alist/v3/cmd/flags"
-	"github.com/alist-org/alist/v3/internal/bootstrap"
-	"github.com/alist-org/alist/v3/internal/conf"
-	"github.com/alist-org/alist/v3/internal/db"
-	"github.com/alist-org/alist/v3/pkg/utils"
-	"github.com/alist-org/alist/v3/server"
-	"github.com/gin-gonic/gin"
-	log "github.com/sirupsen/logrus"
 	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/alist-org/alist/v3/alistlib/internal"
+	"github.com/alist-org/alist/v3/cmd"
+	"github.com/alist-org/alist/v3/cmd/flags"
+	"github.com/alist-org/alist/v3/internal/bootstrap"
+	"github.com/alist-org/alist/v3/internal/conf"
+	"github.com/alist-org/alist/v3/pkg/utils"
+	"github.com/alist-org/alist/v3/server"
+	"github.com/gin-gonic/gin"
+	log "github.com/sirupsen/logrus"
 )
 
 type LogCallback interface {
-	OnLog(level int16, msg string)
+	OnLog(level int16, time int64, message string)
 }
 
 type Event interface {
 	OnStartError(t string, err string)
 	OnShutdown(t string)
+	OnProcessExit(code int)
 }
 
 var event Event
@@ -37,12 +38,15 @@ func Init(e Event, cb LogCallback) error {
 	event = e
 	cmd.Init()
 	logFormatter = &internal.MyFormatter{
-		OnLog: cb.OnLog,
+		OnLog: func(entry *log.Entry) {
+			cb.OnLog(int16(entry.Level), entry.Time.UnixMilli(), entry.Message)
+		},
 	}
 	if utils.Log == nil {
 		return errors.New("utils.log is nil")
 	} else {
 		utils.Log.SetFormatter(logFormatter)
+		utils.Log.ExitFunc = event.OnProcessExit
 	}
 	return nil
 }
@@ -67,6 +71,7 @@ func IsRunning(t string) bool {
 	case "unix":
 		return unixSrv != nil
 	}
+
 	return httpSrv != nil && httpsSrv != nil && unixSrv != nil
 }
 
@@ -85,15 +90,14 @@ func Start() {
 	r := gin.New()
 	r.Use(gin.LoggerWithWriter(log.StandardLogger().Out), gin.RecoveryWithWriter(log.StandardLogger().Out))
 	server.Init(r)
+
 	if conf.Conf.Scheme.HttpPort != -1 {
 		httpBase := fmt.Sprintf("%s:%d", conf.Conf.Scheme.Address, conf.Conf.Scheme.HttpPort)
 		utils.Log.Infof("start HTTP server @ %s", httpBase)
 		httpSrv = &http.Server{Addr: httpBase, Handler: r}
 		go func() {
-			err := httpSrv.ListenAndServe()
-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
-				utils.Log.Fatalf("failed to start http: %s", err.Error())
-			}
+			listenAndServe("http", httpSrv)
+			httpSrv = nil
 		}()
 	}
 	if conf.Conf.Scheme.HttpsPort != -1 {
@@ -101,10 +105,8 @@ func Start() {
 		utils.Log.Infof("start HTTPS server @ %s", httpsBase)
 		httpsSrv = &http.Server{Addr: httpsBase, Handler: r}
 		go func() {
-			err := httpsSrv.ListenAndServeTLS(conf.Conf.Scheme.CertFile, conf.Conf.Scheme.KeyFile)
-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
-				utils.Log.Fatalf("failed to start https: %s", err.Error())
-			}
+			listenAndServe("https", httpsSrv)
+			httpsSrv = nil
 		}()
 	}
 	if conf.Conf.Scheme.UnixFile != "" {
@@ -113,31 +115,44 @@ func Start() {
 		go func() {
 			listener, err := net.Listen("unix", conf.Conf.Scheme.UnixFile)
 			if err != nil {
-				utils.Log.Fatalf("failed to listen unix: %+v", err)
-			}
-			// set socket file permission
-			mode, err := strconv.ParseUint(conf.Conf.Scheme.UnixFilePerm, 8, 32)
-			if err != nil {
-				utils.Log.Errorf("failed to parse socket file permission: %+v", err)
+				//utils.Log.Fatalf("failed to listenAndServe unix: %+v", err)
+				event.OnStartError("unix", err.Error())
 			} else {
-				err = os.Chmod(conf.Conf.Scheme.UnixFile, os.FileMode(mode))
+				// set socket file permission
+				mode, err := strconv.ParseUint(conf.Conf.Scheme.UnixFilePerm, 8, 32)
 				if err != nil {
-					utils.Log.Errorf("failed to chmod socket file: %+v", err)
+					utils.Log.Errorf("failed to parse socket file permission: %+v", err)
+				} else {
+					err = os.Chmod(conf.Conf.Scheme.UnixFile, os.FileMode(mode))
+					if err != nil {
+						utils.Log.Errorf("failed to chmod socket file: %+v", err)
+					}
+				}
+				err = unixSrv.Serve(listener)
+				if err != nil && err != http.ErrServerClosed {
+					event.OnStartError("unix", err.Error())
 				}
 			}
-			err = unixSrv.Serve(listener)
-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
-				utils.Log.Fatalf("failed to start unix: %s", err.Error())
-			}
+
+			unixSrv = nil
 		}()
 	}
 }
 
-func Release() {
-	db.Close()
+func shutdown(srv *http.Server, timeout time.Duration) error {
+	if srv == nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	err := srv.Shutdown(ctx)
+
+	return err
 }
 
-// Shutdown timeout毫秒
+// Shutdown timeout 毫秒
 func Shutdown(timeout int64) (err error) {
 	timeoutDuration := time.Duration(timeout) * time.Millisecond
 	utils.Log.Println("Shutdown server...")
@@ -165,15 +180,7 @@ func Shutdown(timeout int64) (err error) {
 		unixSrv = nil
 		utils.Log.Println("Server UNIX Shutdown")
 	}
-	return nil
-}
 
-func shutdown(srv *http.Server, timeout time.Duration) error {
-	if srv == nil {
-		return nil
-	}
-	Release()
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	return srv.Shutdown(ctx)
+	//cmd.Release()
+	return nil
 }
